@@ -47,14 +47,16 @@ type Descriptor struct {
 
 	// ArtifactType is the media type of the artifact this descriptor refers to.
 	ArtifactType string `json:"artifactType,omitempty"`
+
+	// digestAlgo is the preferred digest algorithm for when the digest is unset.
+	digestAlgo digest.Algorithm
 }
 
 var (
 	// EmptyData is the content of the empty JSON descriptor. See [mediatype.OCI1Empty].
 	EmptyData = []byte("{}")
 	// EmptyDigest is the digest of the empty JSON descriptor. See [mediatype.OCI1Empty].
-	EmptyDigest = digest.FromBytes(EmptyData)
-	emptyDigest = digest.FromBytes([]byte{})
+	EmptyDigest = digest.SHA256.FromBytes(EmptyData)
 	mtToOCI     map[string]string
 )
 
@@ -63,26 +65,47 @@ func init() {
 		mediatype.Docker2ManifestList: mediatype.OCI1ManifestList,
 		mediatype.Docker2Manifest:     mediatype.OCI1Manifest,
 		mediatype.Docker2ImageConfig:  mediatype.OCI1ImageConfig,
+		mediatype.Docker2Layer:        mediatype.OCI1Layer,
 		mediatype.Docker2LayerGzip:    mediatype.OCI1LayerGzip,
+		mediatype.Docker2LayerZstd:    mediatype.OCI1LayerZstd,
 		mediatype.OCI1ManifestList:    mediatype.OCI1ManifestList,
 		mediatype.OCI1Manifest:        mediatype.OCI1Manifest,
 		mediatype.OCI1ImageConfig:     mediatype.OCI1ImageConfig,
+		mediatype.OCI1Layer:           mediatype.OCI1Layer,
 		mediatype.OCI1LayerGzip:       mediatype.OCI1LayerGzip,
+		mediatype.OCI1LayerZstd:       mediatype.OCI1LayerZstd,
 	}
+}
+
+// DigestAlgo returns the algorithm for computing the digest.
+// This prefers the algorithm used by the digest when set, falling back to the preferred digest algorithm, and finally the canonical algorithm.
+func (d Descriptor) DigestAlgo() digest.Algorithm {
+	if d.Digest != "" && d.Digest.Validate() == nil {
+		return d.Digest.Algorithm()
+	}
+	if d.digestAlgo != "" && d.digestAlgo.Available() {
+		return d.digestAlgo
+	}
+	return digest.Canonical
+}
+
+// DigestAlgoPrefer sets the preferred digest algorithm for when the digest is unset.
+func (d *Descriptor) DigestAlgoPrefer(algo digest.Algorithm) error {
+	if !algo.Available() {
+		return fmt.Errorf("digest algorithm is not available: %s%.0w", algo.String(), errs.ErrUnsupported)
+	}
+	d.digestAlgo = algo
+	return nil
 }
 
 // GetData decodes the Data field from the descriptor if available
 func (d Descriptor) GetData() ([]byte, error) {
-	if len(d.Data) == 0 && d.Digest != emptyDigest {
-		return nil, errs.ErrParsingFailed
-	}
 	// verify length
 	if int64(len(d.Data)) != d.Size {
 		return nil, errs.ErrParsingFailed
 	}
 	// generate and verify digest
-	dDig := digest.FromBytes(d.Data)
-	if d.Digest != dDig {
+	if d.Digest != d.DigestAlgo().FromBytes(d.Data) {
 		return nil, errs.ErrParsingFailed
 	}
 	// return data
@@ -143,12 +166,8 @@ func (d Descriptor) Same(d2 Descriptor) bool {
 		return false
 	}
 	// loosen the check on media type since this can be converted from a build
-	if d.MediaType != d2.MediaType {
-		if _, ok := mtToOCI[d.MediaType]; !ok {
-			return false
-		} else if mtToOCI[d.MediaType] != mtToOCI[d2.MediaType] {
-			return false
-		}
+	if d.MediaType != d2.MediaType && (mtToOCI[d.MediaType] != mtToOCI[d2.MediaType] || mtToOCI[d.MediaType] == "") {
+		return false
 	}
 	return true
 }
