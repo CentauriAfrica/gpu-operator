@@ -10,7 +10,6 @@ import (
 	"github.com/sirupsen/logrus"
 
 	"github.com/regclient/regclient/config"
-	"github.com/regclient/regclient/internal/rwfs"
 	"github.com/regclient/regclient/internal/version"
 	"github.com/regclient/regclient/scheme"
 	"github.com/regclient/regclient/scheme/ocidir"
@@ -38,7 +37,6 @@ type RegClient struct {
 	regOpts   []reg.Opts
 	schemes   map[string]scheme.API
 	userAgent string
-	fs        rwfs.RWFS
 }
 
 // Opt functions are used by [New] to create a [*RegClient].
@@ -53,7 +51,6 @@ func New(opts ...Opt) *RegClient {
 		log:     &logrus.Logger{Out: io.Discard},
 		regOpts: []reg.Opts{},
 		schemes: map[string]scheme.API{},
-		fs:      rwfs.OSNew(""),
 	}
 
 	info := version.GetInfo()
@@ -85,7 +82,6 @@ func New(opts ...Opt) *RegClient {
 	rc.schemes["reg"] = reg.New(rc.regOpts...)
 	rc.schemes["ocidir"] = ocidir.New(
 		ocidir.WithLog(rc.log),
-		ocidir.WithFS(rc.fs),
 	)
 
 	rc.log.WithFields(logrus.Fields{
@@ -157,10 +153,18 @@ func WithDockerCreds() Opt {
 	}
 }
 
-// WithFS overrides the backing filesystem (used by ocidir).
-func WithFS(fs rwfs.RWFS) Opt {
+// WithDockerCredsFile adds configuration from a named docker config file with registry logins.
+// This changes the default value from the config file, and should be added after the config file is loaded.
+func WithDockerCredsFile(fname string) Opt {
 	return func(rc *RegClient) {
-		rc.fs = fs
+		configHosts, err := config.DockerLoadFile(fname)
+		if err != nil {
+			rc.log.WithFields(logrus.Fields{
+				"err": err,
+			}).Warn("Failed to load docker creds")
+			return
+		}
+		rc.hostLoad("docker-file", configHosts)
 	}
 }
 

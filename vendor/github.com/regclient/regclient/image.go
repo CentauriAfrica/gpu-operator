@@ -24,6 +24,7 @@ import (
 	"github.com/regclient/regclient/pkg/archive"
 	"github.com/regclient/regclient/scheme"
 	"github.com/regclient/regclient/types"
+	"github.com/regclient/regclient/types/blob"
 	"github.com/regclient/regclient/types/descriptor"
 	"github.com/regclient/regclient/types/docker/schema2"
 	"github.com/regclient/regclient/types/errs"
@@ -436,6 +437,55 @@ func (rc *RegClient) ImageCheckBase(ctx context.Context, r ref.Ref, opts ...Imag
 	return nil
 }
 
+// ImageConfig returns the OCI config of a given image.
+// Use [ImageWithPlatform] to select a platform from an Index or Manifest List.
+func (rc *RegClient) ImageConfig(ctx context.Context, r ref.Ref, opts ...ImageOpts) (*blob.BOCIConfig, error) {
+	opt := imageOpt{
+		platform: "local",
+	}
+	for _, optFn := range opts {
+		optFn(&opt)
+	}
+	p, err := platform.Parse(opt.platform)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse platform %s: %w", opt.platform, err)
+	}
+	m, err := rc.ManifestGet(ctx, r, WithManifestPlatform(p))
+	if err != nil {
+		return nil, fmt.Errorf("failed to get manifest: %w", err)
+	}
+	for m.IsList() {
+		mi, ok := m.(manifest.Indexer)
+		if !ok {
+			return nil, fmt.Errorf("unsupported manifest type: %s", m.GetDescriptor().MediaType)
+		}
+		ml, err := mi.GetManifestList()
+		if err != nil {
+			return nil, fmt.Errorf("failed to get manifest list: %w", err)
+		}
+		d, err := descriptor.DescriptorListSearch(ml, descriptor.MatchOpt{Platform: &p})
+		if err != nil {
+			return nil, fmt.Errorf("failed to find platform in manifest list: %w", err)
+		}
+		m, err = rc.ManifestGet(ctx, r, WithManifestDesc(d))
+		if err != nil {
+			return nil, fmt.Errorf("failed to get manifest: %w", err)
+		}
+	}
+	mi, ok := m.(manifest.Imager)
+	if !ok {
+		return nil, fmt.Errorf("unsupported manifest type: %s", m.GetDescriptor().MediaType)
+	}
+	d, err := mi.GetConfig()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get image config: %w", err)
+	}
+	if d.MediaType != mediatype.OCI1ImageConfig && d.MediaType != mediatype.Docker2ImageConfig {
+		return nil, fmt.Errorf("unsupported config media type %s: %w", d.MediaType, errs.ErrUnsupportedMediaType)
+	}
+	return rc.BlobGetOCIConfig(ctx, r, d)
+}
+
 // ImageCopy copies an image.
 // This will retag an image in the same repository, only pushing and pulling the top level manifest.
 // On the same registry, it will attempt to use cross-repository blob mounts to avoid pulling blobs.
@@ -604,7 +654,8 @@ func (rc *RegClient) imageCopyOpt(ctx context.Context, refSrc ref.Ref, refTgt re
 					// known manifest media type
 					err = rc.imageCopyOpt(ctx, entrySrc, entryTgt, dEntry, true, parentsNew, opt)
 				case mediatype.Docker2ImageConfig, mediatype.OCI1ImageConfig,
-					mediatype.Docker2LayerGzip, mediatype.OCI1Layer, mediatype.OCI1LayerGzip,
+					mediatype.Docker2Layer, mediatype.Docker2LayerGzip, mediatype.Docker2LayerZstd,
+					mediatype.OCI1Layer, mediatype.OCI1LayerGzip, mediatype.OCI1LayerZstd,
 					mediatype.BuildkitCacheConfig:
 					// known blob media type
 					err = rc.imageCopyBlob(ctx, entrySrc, entryTgt, dEntry, opt, bOpt...)
@@ -1041,6 +1092,9 @@ func (rc *RegClient) ImageExport(ctx context.Context, r ref.Ref, outStream io.Wr
 		if err != nil {
 			return err
 		}
+		if err = conf.Digest.Validate(); err != nil {
+			return err
+		}
 		refTag := opt.exportRef.ToReg()
 		if refTag.Digest != "" {
 			refTag.Digest = ""
@@ -1059,6 +1113,9 @@ func (rc *RegClient) ImageExport(ctx context.Context, r ref.Ref, outStream io.Wr
 			return err
 		}
 		for _, d := range dl {
+			if err = d.Digest.Validate(); err != nil {
+				return err
+			}
 			dockerManifest.Layers = append(dockerManifest.Layers, tarOCILayoutDescPath(d))
 			dockerManifest.LayerSources[d.Digest] = d
 		}
@@ -1081,6 +1138,9 @@ func (rc *RegClient) ImageExport(ctx context.Context, r ref.Ref, outStream io.Wr
 
 // imageExportDescriptor pulls a manifest or blob, outputs to a tar file, and recursively processes any nested manifests or blobs
 func (rc *RegClient) imageExportDescriptor(ctx context.Context, r ref.Ref, desc descriptor.Descriptor, twd *tarWriteData) error {
+	if err := desc.Digest.Validate(); err != nil {
+		return err
+	}
 	tarFilename := tarOCILayoutDescPath(desc)
 	if twd.files[tarFilename] {
 		// blob has already been imported into tar, skip
@@ -1321,7 +1381,7 @@ func (rc *RegClient) imageImportDockerAddLayerHandlers(ctx context.Context, r re
 	trd.dockerManifest.Layers = make([]descriptor.Descriptor, len(trd.dockerManifestList[index].Layers))
 
 	// add handler for config
-	trd.handlers[filepath.Clean(trd.dockerManifestList[index].Config)] = func(header *tar.Header, trd *tarReadData) error {
+	trd.handlers[filepath.ToSlash(filepath.Clean(trd.dockerManifestList[index].Config))] = func(header *tar.Header, trd *tarReadData) error {
 		// upload blob, digest is unknown
 		d, err := rc.BlobPut(ctx, r, descriptor.Descriptor{Size: header.Size}, trd.tr)
 		if err != nil {
@@ -1339,12 +1399,17 @@ func (rc *RegClient) imageImportDockerAddLayerHandlers(ctx context.Context, r re
 	// add handlers for each layer
 	for i, layerFile := range trd.dockerManifestList[index].Layers {
 		func(i int) {
-			trd.handlers[filepath.Clean(layerFile)] = func(header *tar.Header, trd *tarReadData) error {
-				// ensure blob is compressed with gzip to match media type
-				gzipR, err := archive.Compress(trd.tr, archive.CompressGzip)
+			trd.handlers[filepath.ToSlash(filepath.Clean(layerFile))] = func(header *tar.Header, trd *tarReadData) error {
+				// ensure blob is compressed
+				rdrUC, err := archive.Decompress(trd.tr)
 				if err != nil {
 					return err
 				}
+				gzipR, err := archive.Compress(rdrUC, archive.CompressGzip)
+				if err != nil {
+					return err
+				}
+				defer gzipR.Close()
 				// upload blob, digest and size is unknown
 				d, err := rc.BlobPut(ctx, r, descriptor.Descriptor{}, gzipR)
 				if err != nil {
@@ -1430,7 +1495,10 @@ func (rc *RegClient) imageImportOCIHandleManifest(ctx context.Context, r ref.Ref
 	// cache the manifest to avoid needing to pull again later, this is used if index.json is a wrapper around some other manifest
 	trd.manifests[m.GetDescriptor().Digest] = m
 
-	handleManifest := func(d descriptor.Descriptor, child bool) {
+	handleManifest := func(d descriptor.Descriptor, child bool) error {
+		if err := d.Digest.Validate(); err != nil {
+			return err
+		}
 		filename := tarOCILayoutDescPath(d)
 		if !trd.processed[filename] && trd.handlers[filename] == nil {
 			trd.handlers[filename] = func(header *tar.Header, trd *tarReadData) error {
@@ -1449,7 +1517,8 @@ func (rc *RegClient) imageImportOCIHandleManifest(ctx context.Context, r ref.Ref
 					}
 					return rc.imageImportOCIHandleManifest(ctx, r, md, trd, true, child)
 				case mediatype.Docker2ImageConfig, mediatype.OCI1ImageConfig,
-					mediatype.Docker2LayerGzip, mediatype.OCI1Layer, mediatype.OCI1LayerGzip,
+					mediatype.Docker2Layer, mediatype.Docker2LayerGzip, mediatype.Docker2LayerZstd,
+					mediatype.OCI1Layer, mediatype.OCI1LayerGzip, mediatype.OCI1LayerZstd,
 					mediatype.BuildkitCacheConfig:
 					// known blob media types
 					return rc.imageImportBlob(ctx, r, d, trd)
@@ -1463,6 +1532,7 @@ func (rc *RegClient) imageImportOCIHandleManifest(ctx context.Context, r ref.Ref
 				}
 			}
 		}
+		return nil
 	}
 
 	if !push {
@@ -1506,7 +1576,10 @@ func (rc *RegClient) imageImportOCIHandleManifest(ctx context.Context, r ref.Ref
 				return fmt.Errorf("could not find requested tag in index.json, %s", r.Tag)
 			}
 		}
-		handleManifest(d, false)
+		err = handleManifest(d, false)
+		if err != nil {
+			return err
+		}
 		// add a finish step to tag the selected digest
 		trd.finish = append(trd.finish, func() error {
 			mRef, ok := trd.manifests[d.Digest]
@@ -1526,7 +1599,10 @@ func (rc *RegClient) imageImportOCIHandleManifest(ctx context.Context, r ref.Ref
 			return err
 		}
 		for _, d := range dl {
-			handleManifest(d, true)
+			err = handleManifest(d, true)
+			if err != nil {
+				return err
+			}
 		}
 	} else {
 		// else if a single image/manifest
@@ -1537,6 +1613,9 @@ func (rc *RegClient) imageImportOCIHandleManifest(ctx context.Context, r ref.Ref
 		// add handler for the config descriptor if it's defined
 		cd, err := mi.GetConfig()
 		if err == nil {
+			if err = cd.Digest.Validate(); err != nil {
+				return err
+			}
 			filename := tarOCILayoutDescPath(cd)
 			if !trd.processed[filename] && trd.handlers[filename] == nil {
 				func(cd descriptor.Descriptor) {
@@ -1552,6 +1631,9 @@ func (rc *RegClient) imageImportOCIHandleManifest(ctx context.Context, r ref.Ref
 			return err
 		}
 		for _, d := range layers {
+			if err = d.Digest.Validate(); err != nil {
+				return err
+			}
 			filename := tarOCILayoutDescPath(d)
 			if !trd.processed[filename] && trd.handlers[filename] == nil {
 				func(d descriptor.Descriptor) {
@@ -1646,7 +1728,7 @@ func (trd *tarReadData) tarReadAll(rs io.ReadSeeker) error {
 			} else if err != nil {
 				return err
 			}
-			name := filepath.Clean(header.Name)
+			name := filepath.ToSlash(filepath.Clean(header.Name))
 			// track symlinks
 			if header.Typeflag == tar.TypeSymlink || header.Typeflag == tar.TypeLink {
 				// normalize target relative to root of tar
@@ -1657,7 +1739,7 @@ func (trd *tarReadData) tarReadAll(rs io.ReadSeeker) error {
 						return err
 					}
 				}
-				target = filepath.Clean("/" + target)[1:]
+				target = filepath.ToSlash(filepath.Clean("/" + target)[1:])
 				// track and set handleAdded if an existing handler points to the target
 				if trd.linkAdd(name, target) && !trd.handleAdded {
 					list, err := trd.linkList(target)
@@ -1745,23 +1827,29 @@ func (trd *tarReadData) tarReadFileJSON(data interface{}) error {
 var errTarFileExists = errors.New("tar file already exists")
 
 func (td *tarWriteData) tarWriteHeader(filename string, size int64) error {
-	dirname := filepath.Dir(filename)
-	if !td.dirs[dirname] && dirname != "." {
-		header := tar.Header{
-			Format:     tar.FormatPAX,
-			Typeflag:   tar.TypeDir,
-			Name:       dirname,
-			Size:       0,
-			Mode:       td.mode | 0511,
-			ModTime:    td.timestamp,
-			AccessTime: td.timestamp,
-			ChangeTime: td.timestamp,
+	dirName := filepath.ToSlash(filepath.Dir(filename))
+	if !td.dirs[dirName] && dirName != "." {
+		dirSplit := strings.Split(dirName, "/")
+		for i := range dirSplit {
+			dirJoin := strings.Join(dirSplit[:i+1], "/")
+			if !td.dirs[dirJoin] && dirJoin != "" {
+				header := tar.Header{
+					Format:     tar.FormatPAX,
+					Typeflag:   tar.TypeDir,
+					Name:       dirJoin + "/",
+					Size:       0,
+					Mode:       td.mode | 0511,
+					ModTime:    td.timestamp,
+					AccessTime: td.timestamp,
+					ChangeTime: td.timestamp,
+				}
+				err := td.tw.WriteHeader(&header)
+				if err != nil {
+					return err
+				}
+				td.dirs[dirJoin] = true
+			}
 		}
-		err := td.tw.WriteHeader(&header)
-		if err != nil {
-			return err
-		}
-		td.dirs[dirname] = true
 	}
 	if td.files[filename] {
 		return fmt.Errorf("%w: %s", errTarFileExists, filename)
@@ -1797,5 +1885,5 @@ func (td *tarWriteData) tarWriteFileJSON(filename string, data interface{}) erro
 }
 
 func tarOCILayoutDescPath(d descriptor.Descriptor) string {
-	return filepath.Clean(fmt.Sprintf("blobs/%s/%s", d.Digest.Algorithm(), d.Digest.Encoded()))
+	return fmt.Sprintf("blobs/%s/%s", d.Digest.Algorithm(), d.Digest.Encoded())
 }
